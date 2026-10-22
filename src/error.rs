@@ -70,6 +70,17 @@ pub enum AppError {
         source: reqwest::Error,
     },
 
+    /// The RPC endpoint did not complete the request within the configured
+    /// `--timeout`. Distinct from [`AppError::ConnectTimeout`], which bounds
+    /// only the initial TCP/TLS connect. Wraps the underlying reqwest error so
+    /// the original context is preserved.
+    #[error("RPC request timed out after {seconds} seconds")]
+    RequestTimeout {
+        seconds: u64,
+        #[source]
+        source: reqwest::Error,
+    },
+
     // ── WebSocket ────────────────────────────────────────────────
     #[error("failed to open WebSocket connection: {0}")]
     WsConnect(String),
