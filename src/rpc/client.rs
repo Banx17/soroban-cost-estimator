@@ -747,6 +747,7 @@ impl RpcClient {
                         "unable to reach RPC endpoint {url}: {e}. Check --rpc-url / --network and that the node is reachable.",
                         url = self.url
                     ),
+                    data: None,
                 }
             })?;
 
@@ -764,6 +765,7 @@ impl RpcClient {
                     url = self.url,
                     status = health.status,
                 ),
+                data: None,
             })
         }
     }
@@ -961,6 +963,7 @@ impl RpcClient {
 
     /// POST `body` to `url` (with retries), parse the JSON-RPC response, and
     /// extract the raw `result` value.
+    #[allow(clippy::too_many_lines)]
     async fn post_and_parse(
         &self,
         method: &str,
@@ -1066,18 +1069,37 @@ impl RpcClient {
             });
         }
 
-        let response_body: Value = if let Some(d) = deadline {
+        // Read the body as text first (rather than `response.json()`) so the
+        // diagnostics below can show exactly what the node sent — including a
+        // payload that fails to parse as JSON, which would otherwise be lost.
+        // The headers are cloned only when they are about to be logged because
+        // this runs on every RPC call.
+        let logged_headers = if log_payloads {
+            Some(response.headers().clone())
+        } else {
+            None
+        };
+        let raw_body = if let Some(d) = deadline {
             let timeout_ms = self
                 .total_timeout
                 .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or(0);
-            match tokio::time::timeout_at(d, response.json()).await {
+            match tokio::time::timeout_at(d, response.text()).await {
                 Ok(res) => res?,
                 Err(_) => return Err(AppError::TotalTimeout { timeout_ms }),
             }
         } else {
-            response.json().await?
+            response.text().await?
         };
+        if let Some(headers) = logged_headers {
+            eprint!(
+                "{}",
+                format_response_payload(status, &headers, &raw_body, start.elapsed())
+            );
+        }
+
+        let response_body: Value = serde_json::from_str(&raw_body)
+            .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))?;
 
         if let Some(error) = response_body.get("error") {
             let code = error.get("code").and_then(|c| c.as_i64()).unwrap_or(-1);
@@ -1086,16 +1108,20 @@ impl RpcClient {
                 .and_then(|m| m.as_str())
                 .unwrap_or("unknown error")
                 .to_string();
+            let data = error.get("data").cloned();
             debug!(method, code, message, "RPC error response");
             return Err(AppError::Rpc {
                 status: code,
                 message,
+                data,
             });
         }
 
-        let response_body: Value = serde_json::from_str(&raw_body)
-            .map_err(|e| AppError::General(format!("failed to deserialize RPC response: {e}")))?;
-        let result = unwrap_rpc_result(&response_body, method, status)?;
+        let result = response_body.get("result").ok_or_else(|| AppError::Rpc {
+            status: status.as_u16() as i64,
+            message: "response missing 'result' field".to_string(),
+            data: None,
+        })?;
 
         debug!(
             method,
@@ -1104,44 +1130,8 @@ impl RpcClient {
             "RPC response received"
         );
         trace!(method, "RPC call succeeded");
-        Ok(result)
+        Ok(result.clone())
     }
-}
-
-/// Extracts the `result` value from a JSON-RPC response envelope.
-///
-/// A protocol-level `error` object becomes [`AppError::Rpc`] carrying the
-/// server's code and message; a response with neither field is rejected, so a
-/// malformed payload can never masquerade as an empty success.
-fn unwrap_rpc_result(
-    response_body: &Value,
-    method: &str,
-    status: reqwest::StatusCode,
-) -> AppResult<Value> {
-    if let Some(error) = response_body.get("error") {
-        let code = error
-            .get("code")
-            .and_then(serde_json::Value::as_i64)
-            .unwrap_or(-1);
-        let message = error
-            .get("message")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown error")
-            .to_string();
-        debug!(method, code, message, "RPC error response");
-        return Err(AppError::Rpc {
-            status: code,
-            message,
-        });
-    }
-
-    response_body
-        .get("result")
-        .cloned()
-        .ok_or_else(|| AppError::Rpc {
-            status: i64::from(status.as_u16()),
-            message: "response missing 'result' field".to_string(),
-        })
 }
 
 /// Rewrap a reqwest error whose connect phase timed out into an
@@ -1600,13 +1590,13 @@ mod tests {
             if fail_status == 200 {
                 (
                     200u16,
-                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure","data":{"retryable":true,"provider":"stub"}}}"#
                         .to_string(),
                 )
             } else {
                 (
                     fail_status,
-                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure"}}"#
+                    r#"{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"stubbed failure","data":{"retryable":true,"provider":"stub"}}}"#
                         .to_string(),
                 )
             }
@@ -2286,6 +2276,31 @@ mod tests {
             "503 should be retried then succeed: {result:?}"
         );
         assert_eq!(counter.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_rpc_error_preserves_code_message_and_data() {
+        let (url, counter) = spawn_stub(1, 200, r#"{"pong":true}"#).await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(5), 0, false);
+
+        let result: AppResult<Value> = client.call("test.method", serde_json::json!({})).await;
+
+        match result {
+            Err(AppError::Rpc {
+                status,
+                message,
+                data,
+            }) => {
+                assert_eq!(status, -32000);
+                assert_eq!(message, "stubbed failure");
+                assert_eq!(
+                    data,
+                    Some(serde_json::json!({"retryable": true, "provider": "stub"}))
+                );
+            }
+            other => panic!("expected preserved RPC error, got {other:?}"),
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
     }
 
     /// Persistent transient statuses consume every retry, and the final error
