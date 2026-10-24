@@ -171,9 +171,15 @@ async fn payload_logging_is_opt_in() {
         !stderr.contains("[RPC RES]"),
         "response payloads must stay opt-in; got: {stderr}"
     );
-    // The normal, user-facing error is still reported.
+    // The normal, user-facing error is still reported: `health_check` wraps the
+    // JSON-RPC failure, so the endpoint and the server's own message both reach
+    // the user even though no payload dump is written.
     assert!(
         stderr.contains("unable to reach RPC endpoint"),
         "the regular error message must survive; got: {stderr}"
+    );
+    assert!(
+        stderr.contains("invalid transaction: boom"),
+        "the RPC error detail must still reach the user; got: {stderr}"
     );
 }
