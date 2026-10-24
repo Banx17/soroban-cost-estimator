@@ -45,6 +45,8 @@ pub enum AppError {
         status: i64,
         /// Human-readable error message returned by the RPC server.
         message: String,
+        /// Optional structured data returned by the RPC server.
+        data: Option<serde_json::Value>,
     },
 
     /// The endpoint answered with a transient gateway status (502/503/504),
@@ -101,10 +103,26 @@ pub enum AppError {
         source: reqwest::Error,
     },
 
+    /// The RPC endpoint did not complete the request within the configured
+    /// `--timeout`. Distinct from [`AppError::ConnectTimeout`], which bounds
+    /// only the initial TCP/TLS connect. Wraps the underlying reqwest error so
+    /// the original context is preserved.
+    #[error("RPC request timed out after {seconds} seconds")]
+    RequestTimeout {
+        /// The configured request timeout, in seconds.
+        seconds: u64,
+        /// The underlying reqwest error that triggered the timeout.
+        #[source]
+        source: reqwest::Error,
+    },
+
     /// An RPC operation exceeded its overall deadline across retries, backoff,
     /// and fallback endpoints.
     #[error("RPC operation timed out: exceeded overall deadline of {timeout_ms} ms")]
-    TotalTimeout { timeout_ms: u64 },
+    TotalTimeout {
+        /// The overall deadline, in milliseconds, that was exceeded.
+        timeout_ms: u64,
+    },
 
     // ── WebSocket ────────────────────────────────────────────────
     /// The WebSocket handshake or connection attempt failed.
@@ -290,6 +308,7 @@ mod tests {
             AppError::Rpc {
                 status: -32000,
                 message: "boom".to_string(),
+                data: None,
             },
             AppError::TotalTimeout { timeout_ms: 1500 },
             AppError::InvalidHeader("missing '=' separator".to_string()),
