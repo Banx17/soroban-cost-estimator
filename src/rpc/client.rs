@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
 use governor::{Quota, RateLimiter};
@@ -427,6 +427,10 @@ pub struct RpcClient {
     pub headers: HeaderMap,
     /// Whether to print verbose RPC request/response diagnostics to stderr.
     pub verbose: bool,
+    /// Number of RPC attempts made (including retries and failover).
+    last_attempt_count: AtomicU8,
+    /// Whether a fallback RPC endpoint was used during the last call.
+    fallback_used: AtomicBool,
     /// Optional overall deadline spanning retries, backoff, and failover for a
     /// single RPC operation.
     total_timeout: Option<Duration>,
@@ -676,6 +680,8 @@ impl RpcClient {
             connect_timeout,
             headers,
             verbose,
+            last_attempt_count: AtomicU8::new(0),
+            fallback_used: AtomicBool::new(false),
             total_timeout: default_total_timeout(),
         }
     }
@@ -890,6 +896,8 @@ impl RpcClient {
         trace!(
             method,
             header_count = self.headers.len(),
+            attempt_count = self.last_attempt_count.load(Ordering::Relaxed),
+            fallback_used = self.fallback_used.load(Ordering::Relaxed),
             "sending RPC request"
         );
         match self
@@ -911,6 +919,7 @@ impl RpcClient {
                     // The operator-facing notice goes to stderr so it never
                     // contaminates machine-readable stdout (json/csv/markdown).
                     eprintln!("Primary RPC failed, failing over to fallback endpoint: {fallback}");
+                    self.fallback_used.store(true, Ordering::Relaxed);
                     debug!(
                         method,
                         primary = %self.url,
@@ -983,42 +992,50 @@ impl RpcClient {
             eprintln!("[RPC] -> {}", request_body_str);
         }
 
-        let response = with_retry_deadline(self.max_retries, deadline, self.total_timeout, || {
-            let client = client.clone();
-            let url = url.clone();
-            let request_body = request_body.clone();
-            let limiter = limiter.clone();
-            let headers = headers.clone();
+        let response = with_retry_deadline(
+            self.max_retries,
+            deadline,
+            self.total_timeout,
+            || {
+                let client = client.clone();
+                let url = url.clone();
+                let request_body = request_body.clone();
+                let limiter = limiter.clone();
+                let headers = headers.clone();
 
-            async move {
-                // Every outbound attempt (including retries) consumes a
-                // token, so the wire rate never exceeds the configured
-                // requests-per-second cap.
-                if let Some(limiter) = &limiter {
-                    limiter.until_ready().await;
-                }
-                let response = client
-                    .post(&url)
-                    .headers(headers)
-                    .json(&request_body)
-                    .send()
-                    .await
-                    .map_err(|e| map_request_error(e, timeout, connect_timeout))?;
+                async move {
+                    // Every outbound attempt (including retries) consumes a
+                    // token, so the wire rate never exceeds the configured
+                    // requests-per-second cap.
+                    if let Some(limiter) = &limiter {
+                        limiter.until_ready().await;
+                    }
+                    let response = client
+                        .post(&url)
+                        .headers(headers)
+                        .json(&request_body)
+                        .send()
+                        .await
+                        .map_err(|e| map_request_error(e, timeout, connect_timeout))?;
 
-                // Transient statuses (429/5xx) must be turned into errors so
-                // `with_retry` can back off and retry them. Non-transient
-                // statuses fall through and are parsed as JSON-RPC below.
-                let status = response.status();
-                if is_transient_status(status) {
-                    return Err(AppError::HttpStatus {
-                        status: status.as_u16(),
-                        retry_after: parse_retry_after(response.headers()),
-                        message: format!("RPC endpoint returned transient HTTP status {status}"),
-                    });
+                    // Transient statuses (429/5xx) must be turned into errors so
+                    // `with_retry` can back off and retry them. Non-transient
+                    // statuses fall through and are parsed as JSON-RPC below.
+                    let status = response.status();
+                    if is_transient_status(status) {
+                        return Err(AppError::HttpStatus {
+                            status: status.as_u16(),
+                            retry_after: parse_retry_after(response.headers()),
+                            message: format!(
+                                "RPC endpoint returned transient HTTP status {status}"
+                            ),
+                        });
+                    }
+                    Ok::<reqwest::Response, AppError>(response)
                 }
-                Ok::<reqwest::Response, AppError>(response)
-            }
-        })
+            },
+            Some(&self.last_attempt_count),
+        )
         .await?;
         let status = response.status();
 
@@ -1038,17 +1055,25 @@ impl RpcClient {
             });
         }
 
+        // Reading the body can itself time out: reqwest's `timeout` bounds the
+        // whole request, body included. Both the `send()` and the body read are
+        // therefore routed through [`map_request_error`] so a stalled body still
+        // surfaces the descriptive [`AppError::RequestTimeout`] (or the
+        // connect-phase [`AppError::ConnectTimeout`]).
         let response_body: Value = if let Some(d) = deadline {
             let timeout_ms = self
                 .total_timeout
                 .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX))
                 .unwrap_or(0);
-            match tokio::time::timeout_at(d, response.json()).await {
-                Ok(res) => res?,
-                Err(_) => return Err(AppError::TotalTimeout { timeout_ms }),
-            }
+            let Ok(body) = tokio::time::timeout_at(d, response.json()).await else {
+                return Err(AppError::TotalTimeout { timeout_ms });
+            };
+            body.map_err(|e| map_request_error(e, timeout, connect_timeout))?
         } else {
-            response.json().await?
+            response
+                .json()
+                .await
+                .map_err(|e| map_request_error(e, timeout, connect_timeout))?
         };
 
         if let Some(error) = response_body.get("error") {
@@ -1839,6 +1864,34 @@ mod tests {
         format!("http://{addr}")
     }
 
+    /// Spawns an HTTP server that sends the response *headers* — announcing a
+    /// body — and then never writes that body, so the client's whole-request
+    /// timeout fires while the body is being read rather than in `send()`.
+    async fn spawn_stalled_body_stub() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to bind stub server");
+        let addr = listener.local_addr().expect("no local address");
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    // Promise 64 bytes and then send nothing: the client sees
+                    // the status line and headers, then blocks on the body.
+                    let headers = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                                   Content-Length: 64\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(headers.as_bytes()).await;
+                    let _ = stream.flush().await;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+
+        format!("http://{addr}")
+    }
+
     /// A per-request timeout configured via `with_options` must actually
     /// bound the request — against a server that accepts but never answers —
     /// and surface the acceptance criterion's descriptive message rather than
@@ -1853,6 +1906,27 @@ mod tests {
             .await
             .expect_err("a hanging server must eventually produce a timeout error");
 
+        assert_eq!(error.to_string(), "RPC request timed out after 1 seconds");
+    }
+
+    /// A timeout that fires while the response *body* is being read must go
+    /// through the same mapping as one that fires in `send()`, so it surfaces
+    /// the descriptive [`AppError::RequestTimeout`] instead of a generic
+    /// transport error.
+    #[tokio::test]
+    async fn test_body_read_timeout_maps_to_descriptive_error() {
+        let url = spawn_stalled_body_stub().await;
+        let client = RpcClient::with_options(&url, None, Duration::from_secs(1), 0, false);
+
+        let error = client
+            .call::<Value>("test.method", serde_json::json!({}))
+            .await
+            .expect_err("a stalled response body must eventually time out");
+
+        assert!(
+            matches!(error, AppError::RequestTimeout { seconds: 1, .. }),
+            "a body-read timeout must map to RequestTimeout: {error}"
+        );
         assert_eq!(error.to_string(), "RPC request timed out after 1 seconds");
     }
 
