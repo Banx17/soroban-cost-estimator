@@ -18,6 +18,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<redacted>`, and the dump goes to standard error so the data written to
   standard output is unaffected. `RUST_LOG=debug` enables the same diagnostics
   without `--verbose` (#298).
+- `config snapshot --skip-unchanged` — compare the fetched configuration with
+  the latest stored snapshot and skip the write when nothing changed.
+  Timestamps, ledgers and schema versions are ignored for the comparison, the
+  command exits `0` either way, and `--json` reports
+  `"status": "unchanged"` when it skipped (#509).
+- Config snapshots now carry an explicit `schema_version` (the initial schema
+  is version `1`). Unversioned files from older releases are read as that
+  version and are never rewritten by a read; files written by a newer release
+  are rejected with the file name and an upgrade hint (#508).
 - `wasm info --json` now includes a `function_signatures` block with each exported
   function's spec presence, raw WASM param/result counts, and parameter and
   return types; names and types are explicit `null`s when the contract spec is
@@ -124,6 +133,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `config snapshot` no longer prints its four summary lines twice in table
+  mode, and `--quiet` is now honoured for them. CSV and Markdown output no
+  longer has the human-readable summary mixed into it, so each format stays
+  parseable.
 - The CLI no longer overflows the stack on Windows. `clap`'s derive macros
   build the whole command tree on the stack, which needs close to a megabyte
   in an unoptimized build, while the main thread of a Windows process is
